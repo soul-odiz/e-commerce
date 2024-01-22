@@ -1,17 +1,12 @@
 from datetime import datetime
 from flask_migrate import Migrate
 import paypalrestsdk
-from flask import Flask, request, redirect, flash, session, jsonify, url_for, g, send_from_directory
+from flask import Flask, request, redirect, flash, session, jsonify, url_for, g
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
 from flask_cors import CORS, cross_origin
 from sqlalchemy.dialects.postgresql import JSON
 import stripe
-import os
-
-
-
 from flask_jwt_extended import (
     JWTManager,
     jwt_required,
@@ -37,12 +32,8 @@ paypalrestsdk.configure({
 
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
+migrate = Migrate(app, db)
 CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
-
-UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
-
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 
 
@@ -56,6 +47,11 @@ class Item(db.Model):
     category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=False)
     category = db.relationship('Category', backref=db.backref('items', lazy=True))
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+
+
+class Title(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.String(200), nullable=False)
 
 
 class User(db.Model):
@@ -89,28 +85,41 @@ class Category(db.Model):
 
 with app.app_context():
     db.create_all()
-    
-    
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def save_uploaded_file():
-    if 'image' not in request.files:
-        return None
-    file = request.files['image']
-    if file.filename == '':
-        return None
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-        return filename  # Just return the filename, not the full path
-    return None
+@app.route('/titles', methods=['GET', 'POST'])
+def manage_titles():
+    if request.method == 'POST':
+        content = request.json.get('content')
+        if not content:
+            return jsonify({"success": False, "message": "Title content is required."}), 400
+
+        # Check if a title already exists
+        existing_title = Title.query.first()
+
+        # If a title exists, update it. Otherwise, create a new one.
+        if existing_title:
+            existing_title.content = content
+        else:
+            title = Title(content=content)
+            db.session.add(title)
+
+        db.session.commit()
+        return jsonify({"success": True, "message": "Title added/updated successfully."}), 201
+
+    titles = Title.query.all()
+    titles_data = [{'id': title.id, 'content': title.content} for title in titles]
+    return jsonify(titles_data), 200
 
 
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+@app.route('/title', methods=['GET'])
+def get_title():
+
+    title = Title.query.first()
+
+    if not title:
+        return jsonify({"success": False, "message": "No title found."}), 404
+
+    return jsonify({"success": True, "content": title.content}), 200
 
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -198,6 +207,44 @@ def check_login():
         return jsonify({"loggedIn": False}), 200
 
 
+@app.route('/items/<int:item_id>', methods=['PUT'])
+@jwt_required()
+def edit_item(item_id):
+    user_id = get_jwt_identity()
+
+    item = db.session.get(Item, item_id)
+
+    if not item:
+        return jsonify({"success": False, "message": "Item not found."}), 404
+
+    user = db.session.get(User, user_id)
+    if item.user_id != user_id and not user.is_manager:
+        return jsonify({"success": False, "message": "Access denied."}), 403
+
+    data = request.get_json()
+
+
+    # Update item details based on provided data
+    if 'name' in data:
+        item.name = data['name']
+    if 'description' in data:
+        item.description = data['description']
+    if 'price' in data:
+        item.price = float(data['price'])
+    if 'image' in data:
+        item.image = data['image']
+    if 'options' in data:
+        item.options = data['options']
+    if 'category_id' in data:
+        item.category_id = data['category_id']
+
+    try:
+        db.session.commit()
+        return jsonify({"success": True, "message": "Item updated successfully."}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route('/manager/dashboard')
 @jwt_required()
 def manager_dashboard():
@@ -212,23 +259,20 @@ def manager_dashboard():
         items = []
 
     items_data = [{'id': item.id, 'name': item.name, 'description': item.description,
-                   'price': item.price, 'image': url_for('uploaded_file', filename=item.image)} for item in items]
+                   'price': item.price, 'image': item.image} for item in items]
     return jsonify({"success": True, "items": items_data}), 200
 
 
 @app.route('/create_item', methods=['POST'])
 def create_item():
     if request.method == 'POST':
-        filepath = save_uploaded_file()
-        if not filepath:
-            return jsonify({"success": False, "message": "Invalid image or image not provided"}), 400
-
-        name = request.form['name']
-        description = request.form['description']
-        price = float(request.form['price'])
-        image = filepath
-        category_id = request.form['category']
-        options = request.form.get('options', [])  # Get the options from the request data
+        data = request.get_json()
+        name = data['name']
+        description = data['description']
+        price = float(data['price'])
+        image = data['image']
+        category_id = data['category']
+        options = data.get('options', [])  # Get the options from the request data
         category = db.session.get(Category, category_id)
         item = Item(name=name, description=description, price=price, image=image, category=category, options=options)
         db.session.add(item)
@@ -239,16 +283,11 @@ def create_item():
 
 
 
-
 @app.route('/create_category', methods=['POST'])
 def create_category():
     if request.method == 'POST':
-        name = request.form['name']
-        filepath = save_uploaded_file()
-        if not filepath:
-            return jsonify({"success": False, "message": "Invalid image or image not provided"}), 400
-
-        image = filepath
+        name = request.json.get('name')
+        image = request.json.get('image')
 
         if not name:
             return jsonify({"success": False, "message": "Category name is required."}), 400
@@ -310,13 +349,12 @@ def remove_from_cart(item_id):
     return jsonify({"success": False, "message": "Invalid method"}), 405
 
 
-
 @app.route('/items', methods=['GET'])
 def get_items():
     try:
         items = [item for item in Item.query.all() if item.options]
         items_data = [{'id': item.id, 'name': item.name, 'description': item.description,
-                       'price': item.price, 'image': url_for('uploaded_file', filename=item.image), 'options': item.options} for item in items]
+                       'price': item.price, 'image': item.image, 'options': item.options} for item in items]
         return jsonify(items_data), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -326,7 +364,7 @@ def get_items_by_category(category_id):
     try:
         items = Item.query.filter_by(category_id=category_id).all()
         items_data = [{'id': item.id, 'name': item.name, 'description': item.description,
-                       'price': item.price, 'image': url_for('uploaded_file', filename=item.image), 'options': item.options} for item in items]
+                       'price': item.price, 'image': item.image, 'options': item.options} for item in items]
         return jsonify(items_data), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -376,8 +414,7 @@ def delete_category(category_id):
 def get_categories():
     try:
         categories = Category.query.all()
-        categories_data = [{'id': category.id, 'name': category.name, 
-                            'image': url_for('uploaded_file', filename=category.image)} for category in categories]
+        categories_data = [{'id': category.id, 'name': category.name, 'image': category.image} for category in categories]
         return jsonify(categories_data), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
